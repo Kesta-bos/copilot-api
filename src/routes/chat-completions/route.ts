@@ -3,12 +3,17 @@ import { Hono } from "hono"
 import { FetchError } from "ofetch"
 import { logToFile } from "~/lib/logger"
 import { APP_CONFIG } from "~/lib/config"
-import { isCircuitOpen } from "~/lib/error-handler"
+import { isCircuitOpen, isNonCountingError, getFailureStats } from "~/lib/error-handler"
 
 import { handler } from "./handler"
 import { handlerStreaming } from "./handler-streaming"
 
 export const completionRoutes = new Hono()
+
+// Add an endpoint to view the circuit breaker stats
+completionRoutes.get("/status", (c) => {
+  return c.json(getFailureStats())
+})
 
 completionRoutes.post("/", async (c) => {
   try {
@@ -57,17 +62,37 @@ completionRoutes.post("/", async (c) => {
   } catch (error) {
     // Enhanced error logging
     if (error instanceof FetchError) {
-      consola.error(`Request failed: ${error.message}`, error.response?._data)
+      const errorMessage = error.message;
+      
+      // Special handling for aborted connections
+      if (isNonCountingError(errorMessage)) {
+        consola.info(`Client aborted connection: ${errorMessage}`);
+        await logToFile("client-abort", errorMessage);
+        
+        // Return 499 Client Closed Request (not standard HTTP but used by Nginx)
+        return c.json(
+          {
+            error: {
+              message: "Client closed connection",
+              type: "client_error",
+              code: "client_closed_request",
+            }
+          },
+          499
+        );
+      }
+      
+      consola.error(`Request failed: ${errorMessage}`, error.response?._data)
       
       // Log to file if enabled
-      await logToFile("error", `FetchError: ${error.message} - ${JSON.stringify(error.response?._data || {})}`)
+      await logToFile("error", `FetchError: ${errorMessage} - ${JSON.stringify(error.response?._data || {})}`)
       
       // Return appropriate error response based on status code
       const statusCode = error.statusCode || 500
       return c.json(
         {
           error: {
-            message: `Error from upstream API: ${error.message}`,
+            message: `Error from upstream API: ${errorMessage}`,
             type: "api_error",
             status: statusCode,
             data: error.response?._data || {},
@@ -96,13 +121,33 @@ completionRoutes.post("/", async (c) => {
         error.status
       )
     } else if (error instanceof Error) {
-      consola.error("Error:", error.message, error.stack)
-      await logToFile("error", `General error: ${error.message}\n${error.stack || ''}`)
+      const errorMessage = error.message;
+      
+      // Special handling for aborted connections
+      if (isNonCountingError(errorMessage)) {
+        consola.info(`Client aborted connection: ${errorMessage}`);
+        await logToFile("client-abort", errorMessage);
+        
+        // Return 499 Client Closed Request
+        return c.json(
+          {
+            error: {
+              message: "Client closed connection",
+              type: "client_error",
+              code: "client_closed_request",
+            }
+          },
+          499
+        );
+      }
+      
+      consola.error("Error:", errorMessage, error.stack)
+      await logToFile("error", `General error: ${errorMessage}\n${error.stack || ''}`)
       
       return c.json(
         {
           error: {
-            message: `An error occurred: ${error.message}`,
+            message: `An error occurred: ${errorMessage}`,
             type: "server_error",
           }
         }, 

@@ -5,6 +5,7 @@ import {
   RetryOptions,
   calculateBackoff,
   isCircuitOpen,
+  isNonCountingError,
   recordFailure,
   recordSuccess,
   shouldRetry,
@@ -38,6 +39,7 @@ export async function chatCompletions(
           stream: false,
         },
         retry: false, // We'll handle retries ourselves
+        timeout: 120000, // 2 minutes
       });
       
       // Record successful request
@@ -45,22 +47,37 @@ export async function chatCompletions(
       return response;
       
     } catch (error) {
-      // Get status code if available
+      // Get status code and error message if available
       let statusCode = 0;
+      let errorMessage = "";
+      
       if (error instanceof FetchError) {
         statusCode = error.statusCode || 0;
-        consola.error(`Request failed: ${error.message}`, error.response?._data);
-        logToFile("non-stream-error", `${error.message} - ${JSON.stringify(error.response?._data || {})}`);
+        errorMessage = error.message;
+        consola.error(`Request failed: ${errorMessage}`, error.response?._data);
+        logToFile("non-stream-error", `${errorMessage} - ${JSON.stringify(error.response?._data || {})}`);
+      } else if (error instanceof Error) {
+        errorMessage = error.message;
+        consola.error(`Unknown error: ${errorMessage}`);
+        logToFile("non-stream-error", `Unknown error: ${errorMessage}`);
       } else {
-        consola.error(`Unknown error: ${(error as Error).message}`);
-        logToFile("non-stream-error", `Unknown error: ${(error as Error).message}`);
+        errorMessage = String(error);
+        consola.error(`Unexpected error: ${errorMessage}`);
+        logToFile("non-stream-error", `Unexpected error: ${errorMessage}`);
       }
 
-      // Record failure for circuit breaker
-      recordFailure(statusCode);
+      // Check if this is a non-counting error like aborted connections
+      if (isNonCountingError(errorMessage, retryOptions)) {
+        consola.info(`Ignoring non-counting error: ${errorMessage}`);
+        // For aborted connections, just throw through without retry and without recording failure
+        throw error;
+      }
       
-      // Check if we should retry based on status code
-      if (attempt < retryOptions.maxRetries && shouldRetry(statusCode, retryOptions)) {
+      // Record failure for circuit breaker
+      recordFailure(statusCode, errorMessage, retryOptions);
+      
+      // Check if we should retry based on status code and error message
+      if (attempt < retryOptions.maxRetries && shouldRetry(statusCode, errorMessage, retryOptions)) {
         const backoffTime = calculateBackoff(attempt, retryOptions);
         consola.info(`Retrying in ${backoffTime}ms...`);
         await sleep(backoffTime);
